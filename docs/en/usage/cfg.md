@@ -93,6 +93,14 @@ Training settings for YOLO models include hyperparameters and configurations tha
 
 {% include "macros/train-args.md" %}
 
+For ordinary axis-aligned DFL detection such as YOLOv8, `pair` adds an experimental geometric risk loss without changing
+the network or inference decoding. Its default of `0.0` preserves the original losses. With `pair > 0`, `pair_mode=paired`
+penalizes excess horizontal and vertical boundary-pair risk relative to the DFL interpolation target. The `single` ablation
+evaluates each boundary with the opposite boundary fixed to ground truth; `paired_raw` omits the target-risk reference.
+Pair probabilities use products of marginal distributions, not a learned joint distribution. These are training
+regularizers, not calibrated probabilities of localization failure; detection accuracy must be evaluated separately.
+The loss uses existing positive weights and reports the gain-scaled `pair_loss` during training and epoch validation.
+
 !!! info "Note on Batch-size Settings"
 
     The `batch` argument offers three configuration options:

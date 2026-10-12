@@ -1,4 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""Loss functions for Ultralytics detection and related vision tasks."""
 
 from __future__ import annotations
 
@@ -364,7 +365,14 @@ class v8DetectionLoss:
         self.device = device
 
         self.use_dfl = m.reg_max > 1
+        self.pair_gain = getattr(h, "pair", 0.0)
+        if self.pair_gain and (
+            type(self) is not v8DetectionLoss or not self.use_dfl or getattr(m, "one2one_cv2", None) is not None
+        ):
+            raise ValueError("pair > 0 requires ordinary axis-aligned DFL detection, such as YOLOv8.")
         self.loss_names = "box_loss", "cls_loss", "dfl_loss" if self.use_dfl else "l1_loss"
+        if self.pair_gain:
+            self.loss_names += ("pair_loss",)
 
         # Class weights for handling imbalanced datasets
         self.class_weights = getattr(model, "class_weights", None)
@@ -410,13 +418,13 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
-        """Calculate the box, cls, and dfl losses and return them with the assigned targets.
+        """Calculate detection losses, including optional paired-boundary risk, with the assigned targets.
 
         Returns:
             (tuple): A tuple of (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor), the gain-scaled
-                loss tensor (box, cls, dfl) not multiplied by batch size, and a dict of detached loss items.
+                loss tensor (box, cls, dfl, optionally pair) before batch scaling, and detached loss items.
         """
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4 if self.pair_gain else 3, device=self.device)
         pred_distri, pred_scores = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
@@ -469,11 +477,58 @@ class v8DetectionLoss:
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        if self.pair_gain:
+            fg_idx = fg_mask.nonzero(as_tuple=True)
+            risk = self._pair_loss(
+                pred_distri[fg_idx],
+                (target_bboxes / stride_tensor)[fg_idx],
+                anchor_points[fg_idx[1]],
+            )
+            weight = target_scores[fg_idx].sum(-1).float()
+            loss[3] = (risk * weight).sum() / target_scores_sum * self.pair_gain
         return (
             (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
             loss,
             dict(zip(self.loss_names, loss.detach())),
-        )  # loss(box, cls, dfl)
+        )  # loss(box, cls, dfl, optionally pair)
+
+    def _pair_loss(
+        self, pred_dist: torch.Tensor, target_bboxes: torch.Tensor, anchor_points: torch.Tensor
+    ) -> torch.Tensor:
+        """Return per-positive excess geometric risk over the DFL interpolation target.
+
+        Evaluate opposite boundary pairs with the other axis fixed to ground truth, or individual boundaries for
+        the single-edge ablation. Products of marginals approximate pair probabilities, not a learned joint
+        distribution. Geometry uses unclipped targets; the reference follows DFL clipping and interpolation.
+        Compute in float32 under AMP, including empty-positive batches, without changing inference decoding.
+        """
+        with autocast(enabled=False, device=pred_dist.device.type):
+            prob = pred_dist.float().reshape(-1, 4, self.reg_max).softmax(-1)
+            distances = bbox2dist(anchor_points.float(), target_bboxes.float())
+            target = distances.clamp(0, self.reg_max - 1 - 0.01)
+            lower = target.long()
+            fraction = target - lower
+            reference = torch.zeros_like(prob)
+            reference.scatter_(-1, lower.unsqueeze(-1), (1 - fraction).unsqueeze(-1))
+            reference.scatter_add_(-1, (lower + 1).unsqueeze(-1), fraction.unsqueeze(-1))
+            bins = self.proj.float()
+            risks = []
+            pairs = ((0, 2), (1, 3), (2, 0), (3, 1)) if self.hyp.pair_mode == "single" else ((0, 2), (1, 3))
+            for first, second in pairs:
+                left, right = distances[:, first, None, None], distances[:, second, None, None]
+                a = bins.view(1, -1, 1)
+                b = right if self.hyp.pair_mode == "single" else bins.view(1, 1, -1)
+                intersection = (torch.minimum(a, left) + torch.minimum(b, right)).clamp_min(0)
+                union = (a + b + left + right - intersection).clamp_min(1e-7)
+                cost = 1 - intersection / union
+                partner = 1 if self.hyp.pair_mode == "single" else prob[:, second, None, :]
+                target_partner = 1 if self.hyp.pair_mode == "single" else reference[:, second, None, :]
+                predicted_pair = prob[:, first, :, None] * partner
+                reference_pair = reference[:, first, :, None] * target_partner
+                if self.hyp.pair_mode == "paired_raw":
+                    reference_pair = 0
+                risks.append(((predicted_pair - reference_pair) * cost).sum((-2, -1)).clamp_min(0))
+            return torch.stack(risks, -1).mean(-1)
 
     def parse_output(
         self, preds: dict[str, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]
