@@ -1,14 +1,26 @@
+"""Predict wheat disease targets with an experiment checkpoint."""
 
-from ultralytics import YOLO
+import argparse
+import sys
+from pathlib import Path
 
-# 加载自己训练的植物病害检测模型
-model = YOLO(r"E:\盐工\code\ultralytics\runs\detect\train\weights\best.pt")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-# 检测植物叶片图片
-model.predict(
-    source=r"E:\Dataset\PlantDoc.v1-resize-416x416.yolov8\test\images",
-    conf=0.25,
-    imgsz=416,
-    device=0,
-    save=True
-)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="使用四分类实验权重预测图片。")
+    parser.add_argument("--weights", default=str(ROOT / "runs/wheat/innovation_b/pair_seed0/weights/best.pt"))
+    parser.add_argument("--source", default="E:/Dataset/dataset_four_classes/images/test")
+    args = parser.parse_args()
+    from ultralytics import YOLO
+
+    model = YOLO(args.weights)
+    model.predict(
+        source=args.source,
+        conf=0.25,
+        imgsz=640,
+        device=0,
+        save=True,
+        project=str(ROOT / "runs/wheat/innovation_b_predict"),
+        name=Path(args.weights).resolve().parents[1].name,
+    )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import shutil
 import subprocess
@@ -206,6 +207,7 @@ CFG_FLOAT_KEYS = frozenset(
         "box",
         "cls",
         "dfl",
+        "pair",
         "pose",
         "kobj",
         "rle",
@@ -311,7 +313,7 @@ CFG_BOOL_KEYS = frozenset(
         "cls_remap",
     }
 )
-CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment"})
+CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "pair_mode"})
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:
@@ -533,6 +535,14 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         )
                 else:
                     cfg[k] = scheme
+
+    if "pair" in cfg:
+        if not math.isfinite(cfg["pair"]) or cfg["pair"] < 0:
+            raise ValueError("'pair' must be a finite non-negative loss weight.")
+        if cfg["pair"] and cfg.get("task", "detect") != "detect":
+            raise ValueError("pair > 0 is supported only for ordinary DFL detection.")
+    if "pair_mode" in cfg and cfg["pair_mode"] not in {"paired", "paired_squared", "single", "paired_raw"}:
+        raise ValueError("'pair_mode' must be 'paired', 'paired_squared', 'single', or 'paired_raw'.")
 
 
 def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:
