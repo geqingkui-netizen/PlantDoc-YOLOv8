@@ -500,6 +500,7 @@ class v8DetectionLoss:
         Evaluate opposite boundary pairs with the other axis fixed to ground truth, or individual boundaries for
         the single-edge ablation. Products of marginals approximate pair probabilities, not a learned joint
         distribution. Geometry uses unclipped targets; the reference follows DFL clipping and interpolation.
+        The paired_squared candidate squares each positive excess before averaging to soften near-target gradients.
         Compute in float32 under AMP, including empty-positive batches, without changing inference decoding.
         """
         with autocast(enabled=False, device=pred_dist.device.type):
@@ -527,7 +528,8 @@ class v8DetectionLoss:
                 reference_pair = reference[:, first, :, None] * target_partner
                 if self.hyp.pair_mode == "paired_raw":
                     reference_pair = 0
-                risks.append(((predicted_pair - reference_pair) * cost).sum((-2, -1)).clamp_min(0))
+                risk = ((predicted_pair - reference_pair) * cost).sum((-2, -1)).clamp_min(0)
+                risks.append(risk.square() if self.hyp.pair_mode == "paired_squared" else risk)
             return torch.stack(risks, -1).mean(-1)
 
     def parse_output(

@@ -97,6 +97,8 @@ For ordinary axis-aligned DFL detection such as YOLOv8, `pair` adds an experimen
 the network or inference decoding. Its default of `0.0` preserves the original losses. With `pair > 0`, `pair_mode=paired`
 penalizes excess horizontal and vertical boundary-pair risk relative to the DFL interpolation target. The `single` ablation
 evaluates each boundary with the opposite boundary fixed to ground truth; `paired_raw` omits the target-risk reference.
+The `paired_squared` candidate squares each positive directional excess before averaging, so its gradient softens
+as excess risk approaches zero. Squaring changes the loss scale; its gain and detection accuracy need separate validation.
 Pair probabilities use products of marginal distributions, not a learned joint distribution. These are training
 regularizers, not calibrated probabilities of localization failure; detection accuracy must be evaluated separately.
 The loss uses existing positive weights and reports the gain-scaled `pair_loss` during training and epoch validation.
