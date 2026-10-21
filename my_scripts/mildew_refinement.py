@@ -15,6 +15,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+
+import ultralytics
+from ultralytics import YOLO
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
@@ -22,9 +25,6 @@ from ultralytics.utils import ops
 from ultralytics.utils.metrics import box_iou
 from ultralytics.utils.patches import imwrite, torch_load
 from ultralytics.utils.torch_utils import select_device
-
-import ultralytics
-from ultralytics import YOLO
 
 NAMES = {0: "BrownRust", 1: "Healthy", 2: "Loose-Smut", 3: "Mildew"}
 MILDEW = 3
@@ -80,8 +80,16 @@ def inputs(args):
 
 def predict(model, image, args, confidence):
     """Keep preprocessing and NMS identical for all threshold comparisons."""
+    options = {}
+    if getattr(args, "classifier_type", None) == "joint":
+        from functools import partial
+
+        from my_scripts.mildew_joint import JointPredictor
+
+        options["predictor"] = partial(JointPredictor, binary_threshold=0)
     return model.predict(
         source=image,
+        **options,
         conf=confidence,
         imgsz=args.imgsz,
         device=args.device,
@@ -243,7 +251,7 @@ def evaluate(args):
     matcher = DetectionValidator(save_dir=args.output / "matching", args={"plots": False})
     matcher.iouv = torch.tensor([0.5])
     variants = [(t, None) for t in dict.fromkeys([0.25, *args.thresholds])]
-    if classifier:
+    if classifier or args.classifier_type == "joint":
         variants += [(t, tau) for t in args.thresholds for tau in args.cls_thresholds]
     totals = {variant: np.zeros((len(NAMES), 3), dtype=np.int64) for variant in variants}
     sent = Counter()
@@ -259,7 +267,9 @@ def evaluate(args):
             gt = ground_truth(label, result.orig_img)
             white = boxes[:, 5] == MILDEW
             scores = torch.full((len(boxes),), float("nan"))
-            if classifier and white.any():
+            if args.classifier_type == "joint":
+                scores = result.mildew_scores.cpu()
+            elif classifier and white.any():
                 start = time.perf_counter()
                 white_indices = torch.where(white)[0]
                 for chunk in white_indices.split(args.cls_batch):
@@ -396,12 +406,14 @@ def main():
         else:
             sub.add_argument("--split", choices=("val", "test"), default="val")
             sub.add_argument("--classifier", type=Path)
-            sub.add_argument("--classifier-type", choices=("yolo", "resnet18"), default="yolo")
+            sub.add_argument("--classifier-type", choices=("yolo", "resnet18", "joint"), default="yolo")
             sub.add_argument("--thresholds", nargs="+", type=float, default=[0.15, 0.20, 0.30, 0.35])
             sub.add_argument("--cls-thresholds", nargs="+", type=float, default=[0.50])
             sub.add_argument("--cls-batch", type=int, default=32)
     args = parser.parse_args()
     if args.command == "evaluate":
+        if args.classifier_type == "joint" and args.classifier:
+            parser.error("Joint classification is embedded in --model; omit --classifier")
         if any(not 0 < value <= 1 for value in args.thresholds + args.cls_thresholds) or args.cls_batch < 1:
             parser.error("Thresholds must be in (0, 1] and cls-batch must be positive")
     args.output = args.output.resolve()
