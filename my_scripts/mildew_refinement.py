@@ -20,7 +20,8 @@ from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import ops
 from ultralytics.utils.metrics import box_iou
-from ultralytics.utils.patches import imwrite
+from ultralytics.utils.patches import imwrite, torch_load
+from ultralytics.utils.torch_utils import select_device
 
 import ultralytics
 from ultralytics import YOLO
@@ -29,8 +30,8 @@ NAMES = {0: "BrownRust", 1: "Healthy", 2: "Loose-Smut", 3: "Mildew"}
 MILDEW = 3
 
 
-def crop_box(image, box):
-    """Expand by ten percent per side and pad the entire crop to a square."""
+def crop_box(image, box, square=True):
+    """Expand by ten percent per side, optionally padding the crop to a square."""
     height, width = image.shape[:2]
     x1, y1, x2, y2 = map(float, box)
     dx, dy = (x2 - x1) * 0.1, (y2 - y1) * 0.1
@@ -39,6 +40,8 @@ def crop_box(image, box):
     crop = image[y1:y2, x1:x2]
     if not crop.size:
         raise ValueError(f"Empty crop: {box}")
+    if not square:
+        return crop
     h, w = crop.shape[:2]
     side = max(h, w)
     top, left = (side - h) // 2, (side - w) // 2
@@ -209,16 +212,37 @@ def build(args):
 def evaluate(args):
     """Compare fixed operating points using the existing one-to-one detection matcher."""
     model, dataset = inputs(args)
-    classifier = YOLO(str(args.classifier)) if args.classifier else None
-    if classifier and (classifier.task != "classify" or set(classifier.names.values()) != {"mildew", "non_mildew"}):
-        raise ValueError("Classifier must have exactly two classes named mildew and non_mildew")
-    positive_id = (
-        next((key for key, value in classifier.names.items() if value == "mildew"), None) if classifier else None
-    )
+    classifier = None
+    if args.classifier:
+        if args.classifier_type == "resnet18":
+            from PIL import Image, ImageOps
+            from torchvision import models, transforms
+
+            checkpoint = torch_load(args.classifier, map_location="cpu")
+            if checkpoint["classes"] != ["non_mildew", "powdery_mildew"]:
+                raise ValueError("ResNet18 checkpoint classes must be [non_mildew, powdery_mildew]")
+            classifier = models.resnet18(weights=None)
+            classifier.fc = torch.nn.Linear(classifier.fc.in_features, 2)
+            classifier.load_state_dict(checkpoint["model"], strict=True)
+            classifier.to(select_device(args.device, verbose=False)).eval()
+            transform = transforms.Compose(
+                [
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                ]
+            )
+        else:
+            classifier = YOLO(str(args.classifier))
+            if classifier.task != "classify" or set(classifier.names.values()) != {
+                "mildew",
+                "non_mildew",
+            }:
+                raise ValueError("Classifier must have exactly two classes named mildew and non_mildew")
+            positive_id = next(key for key, value in classifier.names.items() if value == "mildew")
     snapshot(args, model)
     matcher = DetectionValidator(save_dir=args.output / "matching", args={"plots": False})
     matcher.iouv = torch.tensor([0.5])
-    variants = [(t, None) for t in args.thresholds]
+    variants = [(t, None) for t in dict.fromkeys([0.25, *args.thresholds])]
     if classifier:
         variants += [(t, tau) for t in args.thresholds for tau in args.cls_thresholds]
     totals = {variant: np.zeros((len(NAMES), 3), dtype=np.int64) for variant in variants}
@@ -239,15 +263,36 @@ def evaluate(args):
                 start = time.perf_counter()
                 white_indices = torch.where(white)[0]
                 for chunk in white_indices.split(args.cls_batch):
-                    crops = [crop_box(result.orig_img, boxes[i, :4]) for i in chunk]
-                    classified = classifier.predict(
-                        source=crops,
-                        imgsz=224,
-                        device=args.device,
-                        verbose=False,
-                        save=False,
-                    )
-                    scores[chunk] = torch.tensor([float(item.probs.data[positive_id].cpu()) for item in classified])
+                    if args.classifier_type == "resnet18":
+                        crops = [
+                            Image.fromarray(crop_box(result.orig_img, boxes[i, :4], square=False)[..., ::-1])
+                            for i in chunk
+                        ]
+                        batch = torch.stack(
+                            [
+                                transform(
+                                    ImageOps.pad(
+                                        crop,
+                                        (224, 224),
+                                        method=Image.Resampling.BILINEAR,
+                                        color=(124, 116, 104),
+                                    )
+                                )
+                                for crop in crops
+                            ]
+                        ).to(next(classifier.parameters()).device)
+                        with torch.inference_mode():
+                            scores[chunk] = classifier(batch).softmax(dim=1)[:, 1].cpu()
+                    else:
+                        crops = [crop_box(result.orig_img, boxes[i, :4]) for i in chunk]
+                        classified = classifier.predict(
+                            source=crops,
+                            imgsz=224,
+                            device=args.device,
+                            verbose=False,
+                            save=False,
+                        )
+                        scores[chunk] = torch.tensor([float(item.probs.data[positive_id].cpu()) for item in classified])
                 elapsed["crop_and_classifier_seconds"] += time.perf_counter() - start
             correct = {}
             for variant in variants:
@@ -351,7 +396,8 @@ def main():
         else:
             sub.add_argument("--split", choices=("val", "test"), default="val")
             sub.add_argument("--classifier", type=Path)
-            sub.add_argument("--thresholds", nargs="+", type=float, default=[0.25, 0.20, 0.15, 0.10])
+            sub.add_argument("--classifier-type", choices=("yolo", "resnet18"), default="yolo")
+            sub.add_argument("--thresholds", nargs="+", type=float, default=[0.15, 0.20, 0.30, 0.35])
             sub.add_argument("--cls-thresholds", nargs="+", type=float, default=[0.50])
             sub.add_argument("--cls-batch", type=int, default=32)
     args = parser.parse_args()
