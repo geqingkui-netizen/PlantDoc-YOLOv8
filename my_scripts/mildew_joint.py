@@ -1,4 +1,4 @@
-"""Joint YOLOv8 and Mildew region classification using existing detection annotations."""
+"""Three-convolution Mildew region classification jointly trained with YOLOv8."""
 
 from __future__ import annotations
 
@@ -24,11 +24,11 @@ NAMES = {0: "BrownRust", 1: "Healthy", 2: "Loose-Smut", 3: "Mildew"}
 MILDEW = 3
 
 
-class JointDetectionModel(DetectionModel):
-    """Share YOLOv8 P3 features with a trainable binary region classifier."""
+class ThreeConvDetectionModel(DetectionModel):
+    """Share YOLOv8 P3 features with a three-convolution binary region classifier."""
 
     def __init__(self, cfg="yolov8n.yaml", ch=3, nc=4, verbose=True):
-        """Build the detector and a small region classifier without external classification data."""
+        """Build the detector and three 3x3, 64-channel convolutions for region classification."""
         super().__init__(cfg, ch=ch, nc=nc, verbose=verbose)
         head = self.model[-1]
         if type(head) is not Detect or getattr(head, "one2one_cv2", None) is not None or nc != 4:
@@ -36,6 +36,10 @@ class JointDetectionModel(DetectionModel):
         channels = head.cv2[0][0].conv.in_channels
         self.region_classifier = nn.Sequential(
             nn.Conv2d(channels, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -179,7 +183,7 @@ class JointValidator(DetectionValidator):
         """Use the live EMA during training and the native checkpoint model during standalone validation."""
         super().init_metrics(model)
         self.joint_model = unwrap_model(model.model if getattr(model, "format", None) == "pt" else model)
-        if not isinstance(self.joint_model, JointDetectionModel):
+        if not isinstance(self.joint_model, ThreeConvDetectionModel):
             raise ValueError("Expected a checkpoint trained with JointTrainer")
 
     def postprocess(self, preds):
@@ -206,7 +210,7 @@ class JointPredictor(DetectionPredictor):
     def postprocess(self, preds, img, orig_imgs, **kwargs):
         """Run the existing NMS and classify its Mildew regions in network input coordinates."""
         model = self.model.model
-        if not isinstance(model, JointDetectionModel):
+        if not isinstance(model, ThreeConvDetectionModel):
             raise ValueError("Expected a checkpoint trained with JointTrainer")
         outputs = nms.non_max_suppression(
             preds, self.args.conf, self.args.iou, self.args.classes, self.args.agnostic_nms, max_det=self.args.max_det
@@ -240,7 +244,7 @@ class JointTrainer(DetectionTrainer):
         cfg = deepcopy(cfg) if isinstance(cfg, dict) else yaml_model_load(cfg or "yolov8n.yaml")
         if not self.resume:
             cfg["mildew_binary_weight"] = self.binary_weight
-        model = JointDetectionModel(cfg, nc=4, ch=self.data["channels"], verbose=verbose)
+        model = ThreeConvDetectionModel(cfg, nc=4, ch=self.data["channels"], verbose=verbose)
         model.names = self.data["names"]
         if weights is not None:
             model.load(weights)
@@ -282,8 +286,8 @@ def main():
         sub.add_argument("--imgsz", type=int, default=640)
         sub.add_argument("--batch", type=int, default=2)
         sub.add_argument("--workers", type=int, default=0)
-        sub.add_argument("--project", default=str(Path(__file__).resolve().parents[1] / "runs/wheat_joint"))
-        sub.add_argument("--name", default=f"joint_{command}")
+        sub.add_argument("--project", default=str(Path(__file__).resolve().parents[1] / "runs/wheat_joint_3conv"))
+        sub.add_argument("--name", default=f"joint_3conv_{command}")
         if command != "predict":
             sub.add_argument("--data", required=True)
         if command == "train":
